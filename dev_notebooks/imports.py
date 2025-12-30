@@ -669,3 +669,135 @@ class DySTANceLoss(nn.Module):
             "avg_min_cost": min_cost.mean().item(),
         }
 
+from typing import Tuple
+
+class DySTANceLoss_v2(nn.Module):
+    """
+    Population comp-sum surrogate loss for DySTANce routing.
+
+    Improvements vs. earlier version:
+      - explicit renormalization of pi over valid tools
+      - entropy computed only over valid tools, optionally normalized by log(panel_size)
+      - robust handling of degenerate panels
+      - preserves original comp-sum formulation but applies per-sample cost-centering
+        (helps allow multiple near-optimal tools)
+    """
+
+    def __init__(
+        self,
+        surrogate_type: str = "logistic",   # "logistic" or "mae"
+        lambda_entropy: float = 0.05,
+        entropy_normalize_by_log: bool = True,  # normalize entropy by log(m_eff)
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.surrogate_type = surrogate_type
+        self.lambda_entropy = lambda_entropy
+        self.eps = eps
+        self.entropy_normalize_by_log = entropy_normalize_by_log
+
+    def forward(
+        self,
+        router_logits: torch.Tensor,  # [B, M]
+        tool_costs: torch.Tensor,     # [B, M] in [0,1] (lower better)
+        validity_mask: torch.Tensor,  # [B, M] in {0,1}
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Returns:
+            total_loss: scalar tensor
+            info: dict of python floats for logging
+        """
+        B, M = router_logits.shape
+        device = router_logits.device
+
+        # ----------------------------
+        # 1) Masked softmax -> pi over valid tools
+        # ----------------------------
+        very_neg = -1e9
+        masked_logits = router_logits.masked_fill(validity_mask == 0, very_neg)
+        pi = F.softmax(masked_logits, dim=1)  # [B, M]
+
+        # Explicitly zero-out invalid slots and renormalize to avoid numerical leakage
+        pi = pi * validity_mask
+        row_sums = pi.sum(dim=1, keepdim=True)
+        # If a row has sum==0 (no valid tools), keep a uniform small mass on valid_mask (degenerate).
+        # But usually row_sums>0; add eps to avoid div by zero.
+        pi = pi / (row_sums + self.eps)
+
+        # ----------------------------
+        # 2) Effective panel size per sample
+        # ----------------------------
+        m_eff = validity_mask.sum(dim=1, keepdim=True)  # [B,1]
+        # Prevent degenerate panels from causing NaNs later; but we also log this condition.
+        m_eff_clamped = torch.clamp(m_eff, min=1.0)
+
+        # ----------------------------
+        # 3) Cost centering (subtract per-sample min among active tools)
+        # ----------------------------
+        # Zero out invalid costs, then set invalid positions to large +ve so min ignores them.
+        big = 1e9
+        active_costs = tool_costs * validity_mask  # zeros at invalid positions
+        # prepare for min: invalid -> +big so min picks among actual actives
+        costs_for_min = active_costs + (1.0 - validity_mask) * big
+        min_cost, _ = torch.min(costs_for_min, dim=1, keepdim=True)  # [B,1], min among actives
+        # In degenerate rows (no actives) min_cost will be big; clamp to zero for safety
+        min_cost = torch.where(min_cost > big / 2.0, torch.zeros_like(min_cost), min_cost)
+
+        centered_costs = active_costs - min_cost  # now >= 0 (for active positions), invalid remain 0
+
+        # Optional: you could also scale by (max-min) to keep ranges bounded, but centering suffices.
+        # ----------------------------
+        # 4) Comp-sum weights w_j = sum_{k!=j} c_k - m + 2
+        # ----------------------------
+        sum_centered = centered_costs.sum(dim=1, keepdim=True)  # [B,1]
+        w = (sum_centered - centered_costs) - m_eff_clamped + 2.0  # [B,M]
+        # w for invalid entries will be masked out downstream
+
+        # ----------------------------
+        # 5) Surrogate Psi(pi)
+        # ----------------------------
+        if self.surrogate_type == "logistic":
+            psi = -torch.log(pi + self.eps)
+        elif self.surrogate_type == "mae":
+            psi = 1.0 - pi
+        else:
+            raise ValueError(f"Unknown surrogate_type={self.surrogate_type}")
+
+        # ----------------------------
+        # 6) Aggregate comp-sum loss (mask invalid tools)
+        #    L_i = sum_j w_ij * Psi(pi_ij)  over valid j
+        # ----------------------------
+        element = w * psi * validity_mask
+        loss_per_sample = element.sum(dim=1)  # [B]
+        loss_main = loss_per_sample.mean()
+
+        # ----------------------------
+        # 7) Entropy regularization (computed over valid tools only)
+        #    You can normalize entropy per-sample by either m_eff or log(m_eff).
+        # ----------------------------
+        # Compute entropy only on valid tools
+        log_pi = torch.log(pi + self.eps)
+        entropy_per_row = -(pi * log_pi * validity_mask).sum(dim=1, keepdim=True)  # [B,1]
+
+        if self.entropy_normalize_by_log:
+            # Normalize by log(m_eff) to get a value approx in [0,1] (if m_eff>=2)
+            # When m_eff==1, log(1)=0 -> avoid dividing by 0; we set denom to 1 in that case.
+            denom = torch.log(m_eff_clamped + 1e-8)
+            denom = torch.where(denom == 0.0, torch.ones_like(denom), denom)
+            entropy_norm = entropy_per_row / (denom + self.eps)
+        else:
+            # simple divide by panel size
+            entropy_norm = entropy_per_row / (m_eff_clamped + self.eps)
+
+        loss_entropy = -self.lambda_entropy * entropy_norm.mean()
+
+        total_loss = loss_main + loss_entropy
+
+        info = {
+            "loss_main": float(loss_main.detach().cpu().item()),
+            "loss_entropy": float(loss_entropy.detach().cpu().item()),
+            "avg_panel_size": float(m_eff.mean().detach().cpu().item()),
+            "avg_min_cost": float(min_cost.mean().detach().cpu().item()),
+        }
+
+        return total_loss, info
