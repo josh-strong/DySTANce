@@ -19,6 +19,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+/dev_notebooks/two_*
+/dev_notebooks/tex.tex
 
 # Virtual environments
 venv/

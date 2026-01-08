@@ -801,3 +801,148 @@ class DySTANceLoss_v2(nn.Module):
         }
 
         return total_loss, info
+
+import torch
+
+def costs_from_probs_binary(preds: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """
+    preds: [B, M] probabilities P(y=1) in [0,1]
+    gt:    [B] binary {0,1}
+    returns costs [B, M] in [0,1] = expected 0-1 error w.r.t. gt
+    """
+    gt_f = gt.float().unsqueeze(1)  # [B,1]
+    return gt_f * (1.0 - preds) + (1.0 - gt_f) * preds
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Tuple, Dict
+
+class DySTANceCompSumEq7Loss(nn.Module):
+    """
+    Multi-expert comp-sum routing surrogate (Eq. 7-style) with multinomial logistic or MAE Psi,
+    consistent with binary tool predictions interpreted as P(y=1).
+
+    Inputs:
+      router_logits: [B, M]
+      tool_probs:    [B, M] in [0,1], interpreted as P(y=1) for each tool
+      gt:           [B] in {0,1}
+      validity_mask:[B, M] in {0,1}
+    """
+
+    def __init__(
+        self,
+        surrogate_type: str = "logistic",     # "logistic" or "mae"
+        lambda_entropy: float = 0.05,
+        entropy_normalize_by_log: bool = True,
+        eps: float = 1e-8,
+        cost_centering: str = "none",         # "none" or "min"
+        clamp_negative_weights: bool = False, # if True, clamps w to >=0 (more stable, less faithful)
+    ):
+        super().__init__()
+        self.surrogate_type = surrogate_type
+        self.lambda_entropy = lambda_entropy
+        self.entropy_normalize_by_log = entropy_normalize_by_log
+        self.eps = eps
+        self.cost_centering = cost_centering
+        self.clamp_negative_weights = clamp_negative_weights
+
+    def forward(
+        self,
+        router_logits: torch.Tensor,  # [B, M]
+        tool_probs: torch.Tensor,     # [B, M] in [0,1] = P(y=1)
+        gt: torch.Tensor,             # [B] in {0,1}
+        validity_mask: torch.Tensor,  # [B, M] in {0,1}
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        B, M = router_logits.shape
+        device = router_logits.device
+
+        validity_mask = validity_mask.to(device)
+        tool_probs = tool_probs.to(device)
+        gt = gt.to(device)
+
+        # ------------
+        # 1) Masked softmax -> pi over valid tools
+        # ------------
+        very_neg = -1e9
+        masked_logits = router_logits.masked_fill(validity_mask == 0, very_neg)
+        pi = F.softmax(masked_logits, dim=1)                 # [B,M]
+        pi = pi * validity_mask                              # zero invalid
+        pi = pi / (pi.sum(dim=1, keepdim=True) + self.eps)   # renormalize -- make sure sum to 1 after masking
+
+        # Effective panel size
+        m_eff = validity_mask.sum(dim=1, keepdim=True)       # [B,1] -- sum over valid tools. Asks how many tools are valid for each sample.
+        m_eff_clamped = torch.clamp(m_eff, min=1.0)          # clamp to prevent division by zero
+
+        # ------------
+        # 2) Compute costs in [0,1] from tool_probs and gt
+        #    c = y*(1-p) + (1-y)*p
+        # ------------
+        gt_f = gt.float().unsqueeze(1)                       # [B,1]
+        tool_costs = gt_f * (1.0 - tool_probs) + (1.0 - gt_f) * tool_probs  # [B,M]
+        tool_costs = tool_costs * validity_mask              # invalid -> 0 (masked anyway)
+
+        # Optional per-sample min-centering (heuristic. changes the surrogate)
+        if self.cost_centering == "min":
+            big = 1e9
+            costs_for_min = tool_costs + (1.0 - validity_mask) * big
+            min_cost, _ = costs_for_min.min(dim=1, keepdim=True)
+            min_cost = torch.where(min_cost > big / 2.0, torch.zeros_like(min_cost), min_cost)
+            tool_costs = (tool_costs - min_cost).clamp_min(0.0)  # keep >=0 for valid
+        else:
+            min_cost = torch.zeros((B,1), device=device)
+
+        # ------------
+        # 3) Comp-sum weights (variable panel size version)
+        #    w_j = sum_{k != j} c_k - m_eff + 2
+        # ------------
+        sum_costs = tool_costs.sum(dim=1, keepdim=True)       # [B,1]
+        w = (sum_costs - tool_costs) - m_eff_clamped + 2.0    # [B,M]
+        w = w * validity_mask
+
+        # Optional stabilizer: prevent negative weights (not faithful to Eq.7)
+        if self.clamp_negative_weights:
+            w = torch.clamp(w, min=0.0)
+
+        # ------------
+        # 4) Surrogate Psi(pi)
+        # ------------
+        if self.surrogate_type == "logistic":
+            psi = -torch.log(pi + self.eps)                  # [B,M]
+        elif self.surrogate_type == "mae":
+            psi = 1.0 - pi
+        else:
+            raise ValueError(f"Unknown surrogate_type={self.surrogate_type}")
+
+        # ------------
+        # 5) Main loss
+        # ------------
+        loss_per_sample = (w * psi).sum(dim=1)               # [B]
+        loss_main = loss_per_sample.mean()
+
+        # ------------
+        # 6) Entropy regularization (over valid tools only)
+        # ------------
+        log_pi = torch.log(pi + self.eps)
+        entropy = -(pi * log_pi * validity_mask).sum(dim=1, keepdim=True)   # [B,1]
+
+        if self.entropy_normalize_by_log:
+            denom = torch.log(m_eff_clamped + 1e-8)
+            denom = torch.where(denom == 0.0, torch.ones_like(denom), denom)
+            entropy_norm = entropy / (denom + self.eps)
+        else:
+            entropy_norm = entropy / (m_eff_clamped + self.eps)
+
+        loss_entropy = -self.lambda_entropy * entropy_norm.mean()
+        total_loss = loss_main + loss_entropy
+
+        info = {
+            "loss_main": float(loss_main.detach().cpu().item()),
+            "loss_entropy": float(loss_entropy.detach().cpu().item()),
+            "avg_panel_size": float(m_eff.detach().cpu().mean().item()),
+            "avg_min_cost": float(min_cost.detach().cpu().mean().item()),
+            "avg_pi_entropy": float(entropy.detach().cpu().mean().item()),
+            "frac_negative_w": float(((w < 0) & (validity_mask > 0)).float().mean().detach().cpu().item()),
+        }
+        return total_loss, info
